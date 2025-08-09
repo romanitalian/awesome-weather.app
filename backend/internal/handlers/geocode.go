@@ -44,12 +44,16 @@ func (h *GeocodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.Set("language", "en")
 	u.RawQuery = p.Encode()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	resp, err := h.Client.Do(req)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_error", "geocoding upstream failed", map[string]string{"error": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
+    var resp *http.Response
+    var err error
+    for attempt := 0; attempt < 2; attempt++ {
+        resp, err = h.Client.Do(req)
+        if err == nil && resp.StatusCode == http.StatusOK { break }
+        if resp != nil { resp.Body.Close() }
+        select { case <-time.After(time.Duration(200*(attempt+1)) * time.Millisecond): case <-ctx.Done(): }
+    }
+    if err != nil { writeError(w, http.StatusBadGateway, "upstream_error", "geocoding upstream failed", map[string]string{"error": err.Error()}); return }
+    defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		writeError(w, http.StatusBadGateway, "upstream_status", "upstream status not ok", map[string]string{"status": http.StatusText(resp.StatusCode)})
 		return

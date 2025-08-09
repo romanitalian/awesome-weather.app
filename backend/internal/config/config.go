@@ -11,6 +11,9 @@ type Config struct {
 	RedisAddr string
 	RedisDB   int
 	RedisPass string
+    // Rate limiting (optional)
+    RateLimitRequests  int // number of requests per window per IP+path
+    RateLimitWindowSec int // window size in seconds
 }
 
 func FromEnv() Config {
@@ -21,6 +24,8 @@ func FromEnv() Config {
 		RedisAddr: valueOrDefault(os.Getenv("REDIS_ADDR"), ""),
 		RedisDB:   intFromEnv("REDIS_DB", 0),
 		RedisPass: os.Getenv("REDIS_PASSWORD"),
+        RateLimitRequests:  intFromEnv("RATE_LIMIT_REQUESTS", 0),
+        RateLimitWindowSec: intFromEnv("RATE_LIMIT_WINDOW_SEC", 60),
 	}
 	return cfg
 }

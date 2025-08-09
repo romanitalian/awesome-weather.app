@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"awapp/backend/internal/metrics"
 	"awapp/backend/internal/models"
 )
 
@@ -25,7 +26,7 @@ type WeatherRQ struct {
 
 type WeatherRS struct {
 	Source string                   `json:"source"`
-	Issued string                   `json:"issued"`
+	Issued time.Time                `json:"issued"`
 	Data   models.WeatherNormalized `json:"data"`
 }
 
@@ -98,80 +99,146 @@ func parseLatLon(latS string, lonS string) (float64, float64, error) {
 func (h *WeatherHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rq, err := h.ParseRQ(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error(), nil)
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid request", map[string]string{"error": err.Error()})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-	defer cancel()
-
-	// cache key: weather:v1:lat:lon:units:days:hours (rounded coords to 2 decimals)
-	key := h.cacheKey(rq)
-	if b, ok, _ := h.Cache.GetBytes(ctx, key); ok {
-		w.Header().Set("X-Cache", "HIT")
-		writeJSONBytes(w, http.StatusOK, b)
-		return
-	}
-
+	ctx := r.Context()
 	rs, err := h.fetchOpenMeteo(ctx, rq)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_error", "weather upstream failed", map[string]string{"error": err.Error()})
+		h.Logger.Error("Failed to fetch weather", "error", err, "lat", rq.Lat, "lon", rq.Lon)
+		writeError(w, http.StatusInternalServerError, "fetch_error", "Failed to fetch weather data", map[string]string{"error": err.Error()})
 		return
 	}
-	out, _ := json.Marshal(rs)
-	_ = h.Cache.SetBytes(ctx, key, out, 10*time.Minute)
-	w.Header().Set("X-Cache", "MISS")
-	writeJSONBytes(w, http.StatusOK, out)
+
+	// Метрики для бизнес-логики
+	cacheStatus := "miss"
+	if rs.Source == "cache" {
+		cacheStatus = "hit"
+	}
+	metrics.WeatherRequestsTotal.WithLabelValues(rq.Units, cacheStatus).Inc()
+
+	data, _ := json.Marshal(rs)
+	writeJSONBytes(w, http.StatusOK, data)
 }
 
 func (h *WeatherHandler) fetchOpenMeteo(ctx context.Context, rq WeatherRQ) (WeatherRS, error) {
-	base := "https://api.open-meteo.com/v1/forecast"
-	u, err := url.Parse(base)
-	if err != nil {
-		return WeatherRS{}, err
+	// Try cache first
+	cacheKey := generateWeatherCacheKey(rq)
+	if cached, found, err := h.Cache.GetBytes(ctx, cacheKey); err == nil && found {
+		var rs WeatherRS
+		if err := json.Unmarshal(cached, &rs); err == nil {
+			rs.Source = "cache" // Помечаем что данные из кэша
+			return rs, nil
+		}
 	}
-	q := u.Query()
-	q.Set("latitude", fmt.Sprintf("%f", rq.Lat))
-	q.Set("longitude", fmt.Sprintf("%f", rq.Lon))
-	q.Set("hourly", "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,pressure_msl,cloud_cover,wind_speed_10m,wind_gusts_10m,wind_direction_10m")
-	q.Set("daily", "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,sunrise,sunset")
-	q.Set("timezone", "UTC")
-	if rq.Units == "imperial" {
-		q.Set("temperature_unit", "fahrenheit")
-		q.Set("wind_speed_unit", "mph")
-		q.Set("precipitation_unit", "inch")
-	} else {
-		q.Set("temperature_unit", "celsius")
-		q.Set("wind_speed_unit", "ms")
-		q.Set("precipitation_unit", "mm")
-	}
-	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return WeatherRS{}, err
+	// Build URL
+	baseURL := "https://api.open-meteo.com/v1/forecast"
+	params := url.Values{}
+	params.Set("latitude", fmt.Sprintf("%.4f", rq.Lat))
+	params.Set("longitude", fmt.Sprintf("%.4f", rq.Lon))
+	params.Set("hourly", "temperature_2m,wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation,pressure_msl,cloud_cover")
+	params.Set("daily", "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,sunrise,sunset")
+	params.Set("timezone", "UTC")
+	params.Set("forecast_days", "7")
+
+	url := baseURL + "?" + params.Encode()
+
+	// Fetch with improved retry logic
+	var resp *http.Response
+	var err error
+	var lastErr error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		start := time.Now()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create request: %w", err)
+			continue
+		}
+
+		resp, err = h.Client.Do(req)
+		duration := time.Since(start)
+
+		// Метрики для внешнего API
+		status := "error"
+		if err == nil {
+			status = fmt.Sprintf("%d", resp.StatusCode)
+		}
+		metrics.ExternalAPICallsTotal.WithLabelValues("open-meteo", "forecast", status).Inc()
+		metrics.ExternalAPIDuration.WithLabelValues("open-meteo", "forecast").Observe(duration.Seconds())
+
+		if err == nil && resp.StatusCode == 200 {
+			break
+		}
+
+		if err != nil {
+			lastErr = err
+			metrics.ExternalAPIErrors.WithLabelValues("open-meteo", "forecast", "network_error").Inc()
+		} else if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("server error %d", resp.StatusCode)
+			metrics.ExternalAPIErrors.WithLabelValues("open-meteo", "forecast", "server_error").Inc()
+		} else {
+			lastErr = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			metrics.ExternalAPIErrors.WithLabelValues("open-meteo", "forecast", "client_error").Inc()
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		if attempt < 3 {
+			// Экспоненциальная задержка: 1s, 2s, 4s
+			delay := time.Duration(1<<(attempt-1)) * time.Second
+			h.Logger.Info("Retrying Open-Meteo API",
+				"attempt", attempt,
+				"delay", delay,
+				"error", lastErr,
+			)
+			time.Sleep(delay)
+		}
 	}
-	resp, err := h.Client.Do(req)
+
 	if err != nil {
-		return WeatherRS{}, err
+		return WeatherRS{}, fmt.Errorf("failed to fetch after retries: %w", lastErr)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return WeatherRS{}, err
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return WeatherRS{}, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(body))
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return WeatherRS{}, fmt.Errorf("upstream status %d", resp.StatusCode)
+
+	var src openMeteoRS
+	if err := json.NewDecoder(resp.Body).Decode(&src); err != nil {
+		return WeatherRS{}, fmt.Errorf("failed to decode response: %w", err)
 	}
-	var payload openMeteoRS
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return WeatherRS{}, err
+
+	// Normalize and validate
+	normalized := normalizeOpenMeteo(src)
+	if err := normalized.Validate(); err != nil {
+		return WeatherRS{}, fmt.Errorf("validation failed: %w", err)
 	}
-	normalized := normalizeOpenMeteo(payload)
-	return WeatherRS{Source: "open-meteo", Issued: time.Now().UTC().Format(time.RFC3339), Data: normalized}, nil
+
+	// Trim to requested size
+	trimmed := trimNormalized(normalized, rq.Hours, rq.Days)
+
+	rs := WeatherRS{
+		Source: "open-meteo",
+		Issued: time.Now().UTC(),
+		Data:   trimmed,
+	}
+
+	// Cache for 30 minutes
+	if data, err := json.Marshal(rs); err == nil {
+		h.Cache.SetBytes(ctx, cacheKey, data, 30*time.Minute)
+	}
+
+	return rs, nil
 }
 
-// minimal Open-Meteo response subset
 type openMeteoRS struct {
 	Latitude  float64 `json:"latitude"`
 	Longitude float64 `json:"longitude"`
@@ -219,10 +286,14 @@ func normalizeOpenMeteo(src openMeteoRS) models.WeatherNormalized {
 		Pressure:      src.HourlyUnits.PressureMsl,
 		CloudCover:    src.HourlyUnits.CloudCover,
 	}
+
 	hours := make([]models.Hour, 0, len(src.Hourly.Time))
 	for i := 0; i < len(src.Hourly.Time); i++ {
+		timeStr := safeString(src.Hourly.Time, i)
+		parsedTime, _ := time.Parse("2006-01-02T15:04", timeStr)
+
 		h := models.Hour{
-			Time:          safeString(src.Hourly.Time, i),
+			Time:          parsedTime,
 			Temperature:   safeFloat(src.Hourly.Temperature2m, i),
 			WindSpeed:     safeFloat(src.Hourly.WindSpeed10m, i),
 			WindGust:      safeFloat(src.Hourly.WindGusts10m, i),
@@ -233,21 +304,31 @@ func normalizeOpenMeteo(src openMeteoRS) models.WeatherNormalized {
 		}
 		hours = append(hours, h)
 	}
+
 	days := make([]models.Day, 0, len(src.Daily.Time))
 	for i := 0; i < len(src.Daily.Time); i++ {
+		dateStr := safeString(src.Daily.Time, i)
+		sunriseStr := safeString(src.Daily.Sunrise, i)
+		sunsetStr := safeString(src.Daily.Sunset, i)
+
+		parsedDate, _ := time.Parse("2006-01-02", dateStr)
+		parsedSunrise, _ := time.Parse("2006-01-02T15:04", sunriseStr)
+		parsedSunset, _ := time.Parse("2006-01-02T15:04", sunsetStr)
+
 		d := models.Day{
-			Date:                  safeString(src.Daily.Time, i),
+			Date:                  parsedDate,
 			TempMax:               safeFloat(src.Daily.Temperature2mMax, i),
 			TempMin:               safeFloat(src.Daily.Temperature2mMin, i),
 			PrecipitationSum:      safeFloat(src.Daily.PrecipitationSum, i),
 			WindSpeedMax:          safeFloat(src.Daily.WindSpeed10mMax, i),
 			WindGustsMax:          safeFloat(src.Daily.WindGusts10mMax, i),
 			WindDirectionDominant: safeFloat(src.Daily.WindDirection10mDominant, i),
-			Sunrise:               safeString(src.Daily.Sunrise, i),
-			Sunset:                safeString(src.Daily.Sunset, i),
+			Sunrise:               parsedSunrise,
+			Sunset:                parsedSunset,
 		}
 		days = append(days, d)
 	}
+
 	current := models.Current{}
 	if len(hours) > 0 {
 		current = models.Current{
@@ -255,8 +336,11 @@ func normalizeOpenMeteo(src openMeteoRS) models.WeatherNormalized {
 			Temperature:   hours[0].Temperature,
 			WindSpeed:     hours[0].WindSpeed,
 			WindDirection: hours[0].WindDirection,
+			Pressure:      hours[0].Pressure,
+			CloudCover:    hours[0].CloudCover,
 		}
 	}
+
 	return models.WeatherNormalized{
 		Latitude:  src.Latitude,
 		Longitude: src.Longitude,
@@ -266,6 +350,28 @@ func normalizeOpenMeteo(src openMeteoRS) models.WeatherNormalized {
 		Hourly:    hours,
 		Daily:     days,
 	}
+}
+
+func trimNormalized(in models.WeatherNormalized, hours int, days int) models.WeatherNormalized {
+	out := in
+	if hours > 0 && len(out.Hourly) > hours {
+		out.Hourly = out.Hourly[:hours]
+		// refresh current from first hour after trim
+		if len(out.Hourly) > 0 {
+			out.Current = models.Current{
+				Time:          out.Hourly[0].Time,
+				Temperature:   out.Hourly[0].Temperature,
+				WindSpeed:     out.Hourly[0].WindSpeed,
+				WindDirection: out.Hourly[0].WindDirection,
+				Pressure:      out.Hourly[0].Pressure,
+				CloudCover:    out.Hourly[0].CloudCover,
+			}
+		}
+	}
+	if days > 0 && len(out.Daily) > days {
+		out.Daily = out.Daily[:days]
+	}
+	return out
 }
 
 func safeString(arr []string, i int) string {
@@ -280,4 +386,22 @@ func safeFloat(arr []float64, i int) float64 {
 		return arr[i]
 	}
 	return 0
+}
+
+// generateWeatherCacheKey creates a cache key for weather data
+func generateWeatherCacheKey(rq WeatherRQ) string {
+	lat := roundTo(rq.Lat, 2)
+	lon := roundTo(rq.Lon, 2)
+	b := make([]byte, 0, 64)
+	b = append(b, "weather:v1:"...)
+	b = append(b, strconv.FormatFloat(lat, 'f', 2, 64)...)
+	b = append(b, ':')
+	b = append(b, strconv.FormatFloat(lon, 'f', 2, 64)...)
+	b = append(b, ':')
+	b = append(b, rq.Units...)
+	b = append(b, ':')
+	b = append(b, strconv.Itoa(rq.Days)...)
+	b = append(b, ':')
+	b = append(b, strconv.Itoa(rq.Hours)...)
+	return string(b)
 }

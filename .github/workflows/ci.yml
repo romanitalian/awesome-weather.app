@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build backend
+        run: |
+          cd backend
+          make build
+          ./bin/server --help || true
+  flutter-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+      - name: Flutter pub get and analyze
+        run: |
+          cd app
+          flutter pub get
+          flutter analyze || true
+      - name: Flutter web build
+        run: |
+          cd app
+          flutter build web --dart-define=API_BASE_URL=/api

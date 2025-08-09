@@ -71,14 +71,19 @@ func (h *MarineHandler) fetchOpenMeteoMarine(ctx context.Context, lat, lon float
 	p.Set("timezone", "UTC")
 	u.RawQuery = p.Encode()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	resp, err := h.Client.Do(req)
-	if err != nil {
-		return MarineRS{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return MarineRS{}, fmt.Errorf("status %d", resp.StatusCode)
-	}
+    var resp *http.Response
+    var err error
+    for attempt := 0; attempt < 2; attempt++ {
+        resp, err = h.Client.Do(req)
+        if err == nil && resp.StatusCode == http.StatusOK {
+            break
+        }
+        if resp != nil { resp.Body.Close() }
+        select { case <-time.After(time.Duration(200*(attempt+1)) * time.Millisecond): case <-ctx.Done(): }
+    }
+    if err != nil { return MarineRS{}, err }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK { return MarineRS{}, fmt.Errorf("status %d", resp.StatusCode) }
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return MarineRS{}, err

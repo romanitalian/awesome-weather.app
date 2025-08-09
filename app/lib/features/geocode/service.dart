@@ -11,4 +11,10 @@ class GeocodeService {
     final data = r.data is Map<String,dynamic> ? r.data as Map<String,dynamic> : jsonDecode(r.data as String) as Map<String,dynamic>;
     return GeocodeRS.fromJson(data);
   }
+
+  Future<GeocodeRS> reverse(double lat, double lon) async {
+    final r = await _api.get('/api/v1/geocode/reverse', query: {'lat': lat, 'lon': lon});
+    final data = r.data is Map<String,dynamic> ? r.data as Map<String,dynamic> : jsonDecode(r.data as String) as Map<String,dynamic>;
+    return GeocodeRS.fromJson(data);
+  }
 }

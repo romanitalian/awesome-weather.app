@@ -45,6 +45,7 @@ macos/Flutter/GeneratedPluginRegistrant.swift
 **/*.xcuserstate
 **/*.xcuserdata/
 **/DerivedData/
+**/Podfile.lock
 
 # Go
 **/*.exe
@@ -54,6 +55,7 @@ macos/Flutter/GeneratedPluginRegistrant.swift
 **/*.dylib
 **/*.test
 **/*.out
+bin/
 
 # Node (if any tooling)
 node_modules/
@@ -65,3 +67,5 @@ Thumbs.db
 
 # Project-specific
 changelog*
+*.log
+flutter_logs.txt

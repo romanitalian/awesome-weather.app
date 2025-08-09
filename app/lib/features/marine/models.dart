@@ -24,7 +24,7 @@ class MarineUnits {
 }
 
 class MarineHour {
-  final String time;
+  final DateTime time;
   final double waveHeight;
   final double wavePeriod;
   final double waveDirection;
@@ -41,7 +41,7 @@ class MarineHour {
     required this.swellDirection,
   });
   factory MarineHour.fromJson(Map<String, dynamic> j) => MarineHour(
-        time: j['time'] as String,
+        time: DateTime.parse(j['time'] as String),
         waveHeight: (j['wave_height'] as num).toDouble(),
         wavePeriod: (j['wave_period'] as num).toDouble(),
         waveDirection: (j['wave_direction'] as num).toDouble(),
@@ -75,12 +75,12 @@ class MarineData {
 
 class MarineRS {
   final String source;
-  final String issued;
+  final DateTime issued;
   final MarineData data;
   const MarineRS({required this.source, required this.issued, required this.data});
   factory MarineRS.fromJson(Map<String, dynamic> j) => MarineRS(
         source: j['source'] as String,
-        issued: j['issued'] as String,
+        issued: DateTime.parse(j['issued'] as String),
         data: MarineData.fromJson(j['data'] as Map<String, dynamic>),
       );
 }

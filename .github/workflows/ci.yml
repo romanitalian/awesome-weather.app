@@ -27,6 +27,11 @@ jobs:
         with:
           flutter-version: '3.27.0'
           channel: 'stable'
+      - name: Flutter env info
+        run: |
+          flutter --version
+          flutter doctor -v
+          flutter config --enable-web
       - name: Flutter pub get and analyze
         run: |
           cd app
@@ -35,4 +40,4 @@ jobs:
       - name: Flutter web build
         run: |
           cd app
-          flutter build web --dart-define=API_BASE_URL=/api
+          flutter build web --release --web-renderer canvaskit --dart-define=API_BASE_URL=/api

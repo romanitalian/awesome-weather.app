@@ -20,7 +20,3 @@ type HistoryNormalized struct {
 	Units     HistoryUnits `json:"units"`
 	Daily     []HistoryDay `json:"daily"`
 }
-
-
-
-

@@ -11,21 +11,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Restore Go cache
+      - name: Restore Go build/module cache
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('backend/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
-      - uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
       - name: Build and test backend
+        working-directory: backend
         run: |
-          cd backend
+          go mod download
           make build
           go vet ./...
           go test ./...
@@ -33,9 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.27.0'
           channel: 'stable'
       - name: Flutter env info
         run: |
@@ -43,11 +46,12 @@ jobs:
           flutter doctor -v
           flutter config --enable-web
       - name: Flutter pub get and analyze
+        working-directory: app
         run: |
-          cd app
           flutter pub get
           flutter analyze || true
       - name: Flutter web build
+        working-directory: app
         run: |
-          cd app
-          flutter build web --release --web-renderer canvaskit --dart-define=API_BASE_URL=/api
+          flutter clean
+          flutter build web --release --web-renderer auto --dart-define=API_BASE_URL=/api --verbose
